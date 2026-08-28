@@ -180,7 +180,7 @@ def nbt_write_payload(tag_type, val):
 
 
 # ─────────────────────────────────────────────────────────────
-# BLOCK & ITEM REMAPPING (1.7.2 -> 1.6.4)
+# BLOCK, ITEM & BIOME REMAPPING (1.7.2 -> 1.6.4)
 # ─────────────────────────────────────────────────────────────
 _BLOCK_REMAP = {}
 
@@ -237,6 +237,27 @@ for _m in range(16):
 # Fern (31:2) -> Grass (31:1)
 _add(31, 2, 31, 1)
 
+# Acacia Stairs (163) -> Oak Stairs (53)
+for _m in range(8):
+    _add(163, _m, 53, _m)
+
+# Dark Oak Stairs (164) -> Oak Stairs (53)
+for _m in range(8):
+    _add(164, _m, 53, _m)
+
+# Wooden Slabs (126) for Acacia (metadata 4) and Dark Oak (metadata 5) -> Oak Slab (126:0)
+for _m in range(16):
+    is_top = _m & 8
+    wood_type = _m & 7
+    if wood_type in (4, 5):
+        _add(126, _m, 126, is_top | 0)
+
+# Double Wooden Slabs (125) for Acacia (4) and Dark Oak (5) -> Oak Double Slab (125)
+for _m in range(16):
+    wood_type = _m & 7
+    if wood_type in (4, 5):
+        _add(125, _m, 125, 0)
+
 # Fast flat lookup table for chunk rewriting
 _REMAP_FLAT = [-1] * (4096 * 16)
 for (_sid, _smeta), (_did, _dmeta) in _BLOCK_REMAP.items():
@@ -263,6 +284,9 @@ def remap_item(item_id, damage):
         return -1, 0
     if item_id < 256:
         return remap_block(item_id, damage)
+    # Acacia Boat -> Oak Boat
+    if item_id == 424:
+        return 333, 0
     # Fish variants (Salmon, Clownfish, Pufferfish) -> Raw Fish
     if item_id == 349:
         return 349, 0
@@ -271,15 +295,45 @@ def remap_item(item_id, damage):
         return 350, 0
     # Fallback for out-of-range 1.7 items
     if item_id > 422:
-        return 280, 0  # Stick
+        return 280, 0  # Stick fallback
     return item_id, damage
 
 
+def remap_nbt_compound(tag):
+    """Recursively walks an NBT tag payload to deep-translate item mappings."""
+    if not isinstance(tag, dict):
+        return
+    if 'id' in tag and 'Damage' in tag:
+        t_id, val_id = tag['id']
+        t_dmg, val_dmg = tag['Damage']
+        if t_id in (NBTTag.TAG_SHORT, NBTTag.TAG_INT) and t_dmg in (NBTTag.TAG_SHORT, NBTTag.TAG_INT):
+            nid, ndmg = remap_item(val_id, val_dmg)
+            tag['id'] = (t_id, nid)
+            tag['Damage'] = (t_dmg, ndmg)
+
+    # Recurse compound elements and list of compounds
+    for k, (t, v) in tag.items():
+        if t == NBTTag.TAG_COMPOUND:
+            remap_nbt_compound(v)
+        elif t == NBTTag.TAG_LIST:
+            elem_type, lst = v
+            if elem_type == NBTTag.TAG_COMPOUND:
+                for item in lst:
+                    remap_nbt_compound(item)
+
+
 def _rewrite_chunk_blocks(raw, prim_mask, add_mask, has_biomes):
+    """Rewrites Chunk Block IDs, Metadata, and prevents NPE Biome client crashes."""
     section_count = bin(prim_mask).count('1')
     add_count = bin(add_mask).count('1')
 
     if section_count == 0:
+        if has_biomes and len(raw) == 256:
+            buf = bytearray(raw)
+            for i in range(256):
+                if buf[i] > 22:
+                    buf[i] = 1 # Map to Plains to avoid client-side crash
+            return bytes(buf)
         return raw
 
     per_light_with_sky = 2048 + 2048 + 2048
@@ -303,13 +357,21 @@ def _rewrite_chunk_blocks(raw, prim_mask, add_mask, has_biomes):
         return raw
 
     buf = bytearray(raw)
+    dirty = False
+
+    # Prevent Biome NPE Crash: 1.6.4 clients crash instantly on Biome IDs > 22
+    if has_biomes and len(buf) >= 256:
+        biome_start = len(buf) - 256
+        for i in range(biome_start, len(buf)):
+            if buf[i] > 22:
+                buf[i] = 1 # Plains fallback
+                dirty = True
+
     meta_off_base = section_count * 4096
     add_base = section_count * (4096 + per_light)
 
     sections = [i for i in range(16) if (prim_mask >> i) & 1]
     add_sections = [i for i in range(16) if (add_mask >> i) & 1]
-
-    dirty = False
 
     for s_idx, sec in enumerate(sections):
         id_start = s_idx * 4096
@@ -722,7 +784,7 @@ def translate_datawatcher(meta_raw):
             i += slen
             out.append(header)
             out.extend(enc_164_str(s[:64]))
-        elif t == 5:  # Slot
+        elif t == 5:  # Slot with Deep NBT Remapping
             if i + 2 > n:
                 break
             iid = struct.unpack('>h', meta_raw[i:i + 2])[0]
@@ -746,6 +808,20 @@ def translate_datawatcher(meta_raw):
                 nbt = meta_raw[i:i + nl]
                 i += nl
             new_id, new_dmg = remap_item(iid, dmg)
+
+            # Deep translate NBT inside the metadata slot
+            if nbt:
+                try:
+                    if nbt[0] == 10:
+                        nlen = struct.unpack('>H', nbt[1:3])[0]
+                        offset = 3 + nlen
+                        compound, _ = nbt_read_payload(NBTTag.TAG_COMPOUND, nbt, offset)
+                        remap_nbt_compound(compound)
+                        new_payload = nbt_write_payload(NBTTag.TAG_COMPOUND, compound)
+                        nbt = nbt[:3+nlen] + new_payload
+                except Exception:
+                    pass
+
             out.append(header)
             out.extend(struct.pack('>hBhh', new_id, cnt, new_dmg, len(nbt) if len(nbt) > 0 else -1))
             if nbt:
@@ -916,6 +992,37 @@ COLOR = {
     "dark_purple": "5", "gold": "6", "gray": "7", "dark_gray": "8", "blue": "9", "green": "a",
     "aqua": "b", "red": "c", "light_purple": "d", "yellow": "e", "white": "f"
 }
+
+_SOUND_MAP = {
+    "game.player.hurt": "damage.hit",
+    "game.player.die": "damage.hit",
+    "game.generic.explode": "random.explode",
+    "game.player.swim": "liquid.swim",
+    "game.player.swim.splash": "liquid.splash",
+    "entity.player.splash": "liquid.splash",
+    "random.anvil_land": "random.anvil_land",
+    "random.anvil_break": "random.anvil_break",
+    "random.anvil_use": "random.anvil_use",
+    "mob.zombie.say": "mob.zombie.say",
+    "mob.zombie.hurt": "mob.zombie.hurt",
+    "mob.zombie.death": "mob.zombie.death",
+    "entity.ghast.shoot": "mob.ghast.fireball",
+    "entity.arrow.shoot": "random.bow",
+    "entity.click": "random.click",
+    "entity.pop": "random.pop",
+}
+
+
+def translate_sound_name(name):
+    """Maps modern 1.7.2 namespace sound names into legal 1.6.4 names."""
+    if name in _SOUND_MAP:
+        return _SOUND_MAP[name]
+    name = name.lower()
+    if name.startswith("game."):
+        name = name.replace("game.", "random.", 1)
+    if name.startswith("entity."):
+        name = name.replace("entity.", "random.", 1)
+    return name[:63]
 
 
 def resolve_chat_to_legacy(obj):
@@ -1093,7 +1200,10 @@ def handle_s2c(sb, csock, state_box, done, cs):
                     csock.sendall(b'\xFF' + enc_164_str(reason_plain[:100]))
                     break
                 elif pid == 0x01:
-                    csock.sendall(b'\xFF' + enc_164_str("online-mode not supported"))
+                    # Target Server is requesting encryption (online-mode=true). Warn player.
+                    print("[!] Target server requires Mojang Online Mode authentication.")
+                    reason = "Target server is in Online Mode. Set online-mode=false in server.properties."
+                    csock.sendall(b'\xFF' + enc_164_str(reason))
                     break
                 elif pid == 0x02:
                     print("[+] Login Success → PLAY")
@@ -1131,6 +1241,20 @@ def _read_slot_raw(r):
     if nl > 0:
         nbt = r.take(nl)
     new_id, new_dmg = remap_item(iid, dmg)
+
+    # Perform deep-nested item NBT ID remapping
+    if nbt:
+        try:
+            if nbt[0] == 10:  # TAG_Compound
+                nlen = struct.unpack('>H', nbt[1:3])[0]
+                offset = 3 + nlen
+                compound, _ = nbt_read_payload(NBTTag.TAG_COMPOUND, nbt, offset)
+                remap_nbt_compound(compound)
+                new_payload = nbt_write_payload(NBTTag.TAG_COMPOUND, compound)
+                nbt = nbt[:3+nlen] + new_payload
+        except Exception:
+            pass
+
     out = struct.pack('>hBhh', new_id, cnt, new_dmg, len(nbt) if len(nbt) > 0 else -1)
     return out + nbt
 
@@ -1216,23 +1340,15 @@ def _s2c(pid, r, csock, cs):
         print(f"[s2c] RESPAWN dim={dim} diff={diff} gm={gm}")
 
     elif pid == 0x08:
-        remaining = r.rem()
-        if remaining >= 41:
-            x = r.f64()
-            feet_y = r.f64()
-            head_y = r.f64()
-            z = r.f64()
-            yaw = r.f32()
-            pitch = r.f32()
-            og = r.u8()
-        else:
-            x = r.f64()
-            feet_y = r.f64()
-            z = r.f64()
-            yaw = r.f32()
-            pitch = r.f32()
-            og = r.u8()
-            head_y = feet_y + 1.62
+        # S2C Player Position and Look — 1.7.2 always 33 bytes (no stance)
+        # 1.6.4 client 0x0D needs 41 bytes WITH stance
+        x = r.f64()
+        feet_y = r.f64()
+        z = r.f64()
+        yaw = r.f32()
+        pitch = r.f32()
+        og = r.u8()
+        head_y = feet_y + 1.62
 
         cs.spawn_x = x
         cs.spawn_y = feet_y
@@ -1266,16 +1382,15 @@ def _s2c(pid, r, csock, cs):
             csock.sendall(b'\x12' + struct.pack('>iB', eid, anim_164))
 
     elif pid == 0x0C:
+        # Spawn Player (GameProfile properties deserializer desync bug fixed)
         eid = r.varint()
         uuid = r.string()
         name = r.string()
         pc = r.varint()
         for _ in range(pc):
-            _ = r.string()
-            _ = r.string()
-            signed = r.u8()
-            if signed:
-                _ = r.string()
+            _prop_name = r.string()
+            _prop_val = r.string()
+            _prop_sig = r.string() # Signature is a string, always present! (Removed invalid boolean parsing)
         x = r.i32()
         y = r.i32()
         z = r.i32()
@@ -1314,7 +1429,7 @@ def _s2c(pid, r, csock, cs):
             vy = r.i16()
             vz = r.i16()
 
-        if typ == 70:  # Falling block
+        if typ == 70:  # Falling block remapping
             bid = obj_data & 0xFFFF
             meta = (obj_data >> 16) & 0xFFFF
             new_id, new_meta = remap_block(bid, meta)
@@ -1521,7 +1636,9 @@ def _s2c(pid, r, csock, cs):
         b1 = r.u8()
         b2 = r.u8()
         bt = r.varint()
-        csock.sendall(b'\x36' + struct.pack('>ihiBBh', x, y, z, b1, b2, bt & 0xFFFF))
+        # Remap the target block action block-type identifier
+        new_bt, _ = remap_block(bt, 0)
+        csock.sendall(b'\x36' + struct.pack('>ihiBBh', x, y, z, b1, b2, new_bt & 0xFFFF))
 
     elif pid == 0x25:
         eid = r.varint()
@@ -1600,20 +1717,21 @@ def _s2c(pid, r, csock, cs):
         csock.sendall(b'\x3D' + struct.pack('>iiBiiB', eff, x, y, z, dat, nrv))
 
     elif pid == 0x29:
+        # Named Sound Effect Name Translator
         name = r.string()
         x = r.i32()
         y = r.i32()
         z = r.i32()
         vol = r.f32()
         pit = r.u8()
-        clean_name = name[:63] if len(name) > 63 else name
+        translated_sound = translate_sound_name(name)
         out = bytearray([0x3E])
-        out.extend(enc_164_str(clean_name))
+        out.extend(enc_164_str(translated_sound))
         out.extend(struct.pack('>iiifB', x, y, z, vol, pit))
         csock.sendall(bytes(out))
 
     elif pid == 0x2A:
-        # World Particles (1.7.2 0x2A -> 1.6.4 AuxSFX 0x3D fallback)
+        # Extensive World Particles Translation (Maps 1.7 particles to standard AuxSFX particles)
         name = r.string()
         x = r.f32()
         y = r.f32()
@@ -1626,17 +1744,25 @@ def _s2c(pid, r, csock, cs):
 
         sfx_id = None
         data = 0
-        if "smoke" in name:
+        if "smoke" in name or "largesmoke" in name:
             sfx_id = 2000
             data = 4
         elif "bonemeal" in name or "happyVillager" in name:
             sfx_id = 2005
-            data = int(pdata)
-        elif "splash" in name or "potion" in name:
+            data = int(pdata) if pdata else 1
+        elif "angryVillager" in name:
+            sfx_id = 2006
+            data = 0
+        elif "splash" in name or "potion" in name or "instantSpell" in name:
             sfx_id = 2002
-            data = int(pdata)
+            data = int(pdata) if pdata else 0
         elif "portal" in name or "ender" in name:
             sfx_id = 2003
+        elif "explode" in name or "hugeexplosion" in name or "largeexplode" in name:
+            sfx_id = 2001
+            data = 35 # Wool block visual impact fallback
+        elif "flame" in name or "lava" in name:
+            sfx_id = 2004
 
         if sfx_id is not None:
             ix = int(x)
@@ -1658,7 +1784,7 @@ def _s2c(pid, r, csock, cs):
         csock.sendall(b'\x47' + struct.pack('>iBiii', eid, typ, x, y, z))
 
     elif pid == 0x2D:
-        # Open Window
+        # Open Window (Filtered window title to prevent raw JSON text leaks)
         wid = r.u8()
         wtype = r.u8()
         title = r.string()
@@ -1666,9 +1792,10 @@ def _s2c(pid, r, csock, cs):
         use_title = r.u8()
         horse_eid = r.i32() if (wtype == 11 and r.rem() >= 4) else None
 
+        clean_title = strip_json_to_plain(title)
         out = bytearray([0x64])
         out.extend(struct.pack('>BB', wid, wtype))
-        out.extend(enc_164_str(title[:32]))
+        out.extend(enc_164_str(clean_title[:32]))
         out.extend(struct.pack('>BB', slots, use_title))
         if wtype == 11 and horse_eid is not None:
             out.extend(struct.pack('>i', horse_eid))
@@ -1733,12 +1860,28 @@ def _s2c(pid, r, csock, cs):
         csock.sendall(bytes(out))
 
     elif pid == 0x35:
+        # Update Tile Entity (Safe nested item NBT translator)
         x = r.i32()
         y = r.i16()
         z = r.i32()
         act = r.u8()
         nlen = r.i16()
         ndata = r.take(nlen) if nlen > 0 else b''
+
+        if ndata and nlen > 0:
+            try:
+                if ndata[0] == 10:  # TAG_Compound
+                    nlen_tag = struct.unpack('>H', ndata[1:3])[0]
+                    offset = 3 + nlen_tag
+                    compound, _ = nbt_read_payload(NBTTag.TAG_COMPOUND, ndata, offset)
+                    remap_nbt_compound(compound)
+                    new_payload = nbt_write_payload(NBTTag.TAG_COMPOUND, compound)
+                    ndata = ndata[:3+nlen_tag] + new_payload
+                    nlen = len(ndata)
+            except Exception as e:
+                if DEBUG:
+                    print(f"[!] TileEntity NBT deep translation failed: {e!r}")
+
         out = bytearray([0x84])
         out.extend(struct.pack('>ihiBh', x, y, z, act, nlen))
         out.extend(ndata)
@@ -1836,6 +1979,10 @@ def _s2c(pid, r, csock, cs):
         dlen = r.i16() if r.rem() >= 2 else 0
         pdata = r.take(dlen) if (dlen > 0 and r.rem() >= dlen) else (r.take(r.rem()) if r.rem() > 0 else b"")
 
+        # Strip unneeded Forge Handshakes for vanilla profile performance safety
+        if "FML" in channel and not cs.is_forge:
+            return
+
         # Texture Pack & Resource Pack Rewriting
         if channel in ("MC|RPack", "MC|TPack"):
             try:
@@ -1875,7 +2022,7 @@ def handle_c2s(cb, ssock, state_box, done, cs):
                 print("[-] c2s: client sent EOF")
                 break
             try:
-                _c2s(pid, cb, ssock, cs)
+                _c2s(pid, cb, ssock, cs, done)
             except Exception as e:
                 print(f"[!] c2s 0x{pid:02X} FAIL: {e!r}")
                 traceback.print_exc()
@@ -1895,11 +2042,24 @@ def _write_slot_172(slot):
     if slot is None or slot.get("id", -1) == -1:
         return struct.pack('>h', -1)
     out = bytearray()
-    out.extend(struct.pack('>h', slot["id"]))
+    new_id, new_damage = remap_item(slot["id"], slot.get("damage", 0))
+    out.extend(struct.pack('>h', new_id))
     out.append((slot.get("count", 1) or 1) & 0xFF)
-    out.extend(struct.pack('>h', slot.get("damage", 0) or 0))
+    out.extend(struct.pack('>h', new_damage))
     nbt = slot.get("nbt", b"")
+
+    # Traverse nested compounds within client-originated actions (Creative slots, etc.)
     if nbt and len(nbt) > 0:
+        try:
+            if nbt[0] == 10:
+                nlen = struct.unpack('>H', nbt[1:3])[0]
+                offset = 3 + nlen
+                compound, _ = nbt_read_payload(NBTTag.TAG_COMPOUND, nbt, offset)
+                remap_nbt_compound(compound)
+                new_payload = nbt_write_payload(NBTTag.TAG_COMPOUND, compound)
+                nbt = nbt[:3+nlen] + new_payload
+        except Exception:
+            pass
         out.extend(struct.pack('>h', len(nbt)))
         out.extend(nbt)
     else:
@@ -1907,7 +2067,7 @@ def _write_slot_172(slot):
     return bytes(out)
 
 
-def _c2s(pid, cb, ssock, cs):
+def _c2s(pid, cb, ssock, cs, done):
     if pid == 0x00:
         ka = cb.read_int()
         if ka is not None:
@@ -1954,33 +2114,31 @@ def _c2s(pid, cb, ssock, cs):
         raw = cb.read_exact(33)
         if not raw or len(raw) < 33:
             return
+        x, feet_y, stance, z, og = struct.unpack('>ddddB', raw)
         if DEBUG_MOVEMENT:
-            _x, feet_y, head_y, _z = struct.unpack('>dddd', raw[:32])
             cs.last_feet_y = feet_y
-            cs.last_head_y = head_y
-        norm = bytearray(raw)
-        norm[32] = 1 if raw[32] else 0
-        ssock.sendall(pack_172(cs, 0x04, bytes(norm)))
+            cs.last_head_y = stance
+        payload = struct.pack('>ddddB', x, feet_y, stance, z, 1 if og else 0)
+        ssock.sendall(pack_172(cs, 0x04, payload))
 
     elif pid == 0x0C:
         raw = cb.read_exact(9)
         if not raw or len(raw) < 9:
             return
-        norm = bytearray(raw)
-        norm[8] = 1 if raw[8] else 0
-        ssock.sendall(pack_172(cs, 0x05, bytes(norm)))
+        yaw, pitch, og = struct.unpack('>ffB', raw)
+        payload = struct.pack('>ffB', yaw, pitch, 1 if og else 0)
+        ssock.sendall(pack_172(cs, 0x05, payload))
 
     elif pid == 0x0D:
         raw = cb.read_exact(41)
         if not raw or len(raw) < 41:
             return
+        x, feet_y, stance, z, yaw, pitch, og = struct.unpack('>ddddffB', raw)
         if DEBUG_MOVEMENT:
-            _x, feet_y, head_y, _z = struct.unpack('>dddd', raw[:32])
             cs.last_feet_y = feet_y
-            cs.last_head_y = head_y
-        norm = bytearray(raw)
-        norm[40] = 1 if raw[40] else 0
-        ssock.sendall(pack_172(cs, 0x06, bytes(norm)))
+            cs.last_head_y = stance
+        payload = struct.pack('>ddddffB', x, feet_y, stance, z, yaw, pitch, 1 if og else 0)
+        ssock.sendall(pack_172(cs, 0x06, payload))
 
     elif pid == 0x0E:
         st = cb.read_sbyte()
@@ -2213,8 +2371,10 @@ def _c2s(pid, cb, ssock, cs):
         ssock.sendall(pack_172(cs, 0x17, payload))
 
     elif pid == 0xFF:
+        # Client disconnect packet (C2S 0xFF has no 1.7.2 companion. Socket is simply closed cleanly)
         m = cb.read_164_string() or ""
-        ssock.sendall(pack_172(cs, 0x40, enc_172_str(m)))
+        print(f"[-] Client disconnecting: {m}")
+        done.set()
 
 
 # ─────────────────────────────────────────────────────────────
