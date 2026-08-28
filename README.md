@@ -1,86 +1,90 @@
-# legacy-bridge — 1.6.4 to 1.7.2 Minecraft Proxy
+# legacy-bridge
 
-> **Notice:** This project is an **unfinished community effort** and a work in progress. It is intended for offline testing and protocol experimentation. Expect bugs, unmapped packet IDs, or desyncs. Contributions are welcome!
+A standalone Python proxy that translates network traffic between a Minecraft 1.6.4 client (protocol 78) and a Minecraft 1.7.2 server (protocol 4). It handles packet structure conversion, encryption handshakes, block and item ID remapping, DataWatcher translation, and chunk rewriting.
 
-`main.py` is a single-file Python proxy that sits between a **Minecraft 1.6.4 client** and a **Minecraft 1.7.2 server**. It translates network protocol packets in real time, remaps 1.7.2 blocks and items to 1.6.4 equivalents, and handles local encryption handshakes to allow legacy clients to play on newer server builds.
+## Requirements
 
----
+* Python 3.8 or newer
+* `cryptography` library
 
-## Technical Features
-
-* **Protocol & Packet Translation:** Translates 1.6.4 C2S packets into 1.7.2 VarInt-encoded streams, and unpacks 1.7.2 S2C packets (handling Zlib compression thresholds dynamically when enabled by the server).
-* **Pure Python Standalone NBT Engine:** Custom zero-dependency NBT parser (`NBTTag`, `nbt_decompress`, `nbt_write_payload`) to parse slot NBT data, chest inventory clicking, and item metadata.
-* **Block & Item Remapping:**
-* Uses a flat, O(1) lookup array (`_REMAP_FLAT`) for fast block ID and metadata conversion.
-* Remaps 1.7.2 content back to safe 1.6.4 visuals (e.g., Stained Glass $\rightarrow$ Glass, Acacia/Dark Oak $\rightarrow$ Oak, Podzol/Red Sand $\rightarrow$ Dirt/Sand, Packed Ice $\rightarrow$ Ice, and 1.7 Flowers $\rightarrow$ Roses).
-* Remaps 1.7.2 fish variants (Salmon, Pufferfish, Clownfish) to Raw/Cooked Fish and falls back out-of-range items to sticks (`ID 280`).
-
-
-* **Dynamic World & Chunk Rewriting:** Decompresses, rewrites block/meta IDs inside single-chunk (`0x33`) and chunk-bulk (`0x38`) payloads, and recompresses them on the fly.
-* **DataWatcher Translation:** `translate_datawatcher()` converts 1.7.2 entity metadata streams into 1.6.4 format to keep mobs, dropped items, and player entity states compatible.
-* **Network & Pass-Through Support:**
-* Generates an on-the-fly RSA-1024 keypair with AES-CFB8 symmetric encryption for the 1.6.4 client handshake.
-* Parses PROXY protocol v1 (ASCII) and v2 (Binary) headers.
-* Handles BungeeCord server switching / re-joins via S2C Respawn (`0x09`) handling.
-
-
-
----
-
-## Dependencies
-
-Requires Python 3.x and the `cryptography` library for handling standard Minecraft RSA/AES-CFB8 encryption:
+Install dependencies with pip:
 
 ```bash
 pip install cryptography
-
 ```
 
----
+## Configuration & Usage
 
-## Quick Start
-
-1. Open `main.py` and set your target 1.7.2 server details:
+Proxy settings are configured directly in `main.py`:
 
 ```python
 LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 25564     # 1.6.4 Client connects here
+LISTEN_PORT = 25564       # Port the 1.6.4 client connects to
 
-TARGET_HOST = "127.0.0.1"
-TARGET_PORT = 25565     # 1.7.2 Server is here
+TARGET_HOST = "127.0.0.1" # 1.7.2 server address
+TARGET_PORT = 25565       # 1.7.2 server port
 
+DEBUG = True
+DEBUG_MOVEMENT = False    # Verbose movement packet logging
+DEBUG_FORGE = True        # Plugin message / Forge channel logging
 ```
 
-2. Run the proxy:
+Run the proxy:
 
 ```bash
 python main.py
-
 ```
 
-3. Connect your 1.6.4 Minecraft client to `localhost:25564`.
+Then point your 1.6.4 client to `localhost:25564`.
 
----
+The target 1.7.2 server must have `online-mode=false` set in `server.properties` unless it is behind an authentication proxy.
 
-## Current Limitations & Known Issues
+## Features
 
-* **Offline Mode Only:** Online-mode Mojang session verification is not supported. The server must have `online-mode=false` (or run behind a local proxy network).
-* **Forge Detection:** Forge strings (`\x00FML\x00`) are logged, but custom FML pipeline handshakes are not fully translated.
-* **Particle Fallbacks:** World particles (`0x2A`) fall back to basic 1.6.4 `AuxSFX` (`0x3D`) events.
-* **Statistics & Achievements:** Server statistics packets (`0x37`) are consumed and ignored.
+### Protocol & Packet Handling
+* **Handshake & Encryption:** Generates an RSA-1024 keypair to handle the 1.6.4 client login handshake, negotiates a shared secret, and switches to AES-CFB8 encryption.
+* **VarInt & Compression:** Handles 1.7.2 VarInt framing and decompresses/compresses network packets when the server sets a Zlib compression threshold (packet `0x03`).
+* **BungeeCord Support:** Handles sub-server transfers and dimension switching via S2C respawn packets (`0x09`).
+* **PROXY Protocol:** Parses both v1 (text) and v2 (binary) PROXY protocol headers from load balancers (HAProxy, Nginx, Cloudflare Spectrum) to preserve original client IP addresses.
+* **Server List Ping:** Intercepts legacy `0xFE` pings and queries the 1.7.2 server status, formatting MOTDs and player counts for the 1.6.4 multiplayer menu.
 
----
+### World & Chunk Rewriting
+* **O(1) Remapping Table:** Uses a flat 65,536-entry lookup array (`_REMAP_FLAT`) for fast block ID and metadata substitution inside single chunk (`0x33`) and chunk bulk (`0x38`) payloads.
+* **Biome ID Clamping:** 1.6.4 clients crash when receiving biome IDs higher than 22. The chunk parser automatically rewrites unknown 1.7 biomes to Plains (ID 1).
+* **NBT Translation:** Includes a pure-Python NBT parser/serializer (`NBTTag`) to rewrite block and item IDs inside tile entities and inventory slots without third-party NBT dependencies.
 
-## Contributing
+### Remapping Reference
 
-PRs and fixes are welcome! Areas that need the most work:
+| 1.7.2 Block / Item | Mapped 1.6.4 Equivalent |
+| :--- | :--- |
+| Stained Glass (`95:*`) | Glass (`20:0`) |
+| Stained Glass Pane (`160:*`) | Glass Pane (`102:0`) |
+| Acacia / Dark Oak Planks (`5:4`, `5:5`) | Oak Planks (`5:0`) |
+| Acacia / Dark Oak Logs (`17:4`, `17:5`) | Oak Log (`17:0`) |
+| Acacia / Dark Oak Leaves (`18:4`, `18:5`) | Oak Leaves (`18:0`) |
+| Logs 2 / Leaves 2 (`161:*`, `162:*`) | Oak Log / Oak Leaves |
+| Podzol (`3:2`) | Dirt (`3:0`) |
+| Red Sand (`12:1`) | Sand (`12:0`) |
+| Packed Ice (`174`) | Ice (`79:0`) |
+| 1.7 Flowers (`38:1-9`) | Rose (`37:0`) |
+| Double Plants (`175:*`) | Tallgrass (`31:1`) |
+| Acacia / Dark Oak Stairs (`163`, `164`) | Oak Stairs (`53`) |
+| Acacia / Dark Oak Slabs (`125`, `126`) | Oak Slabs (`125`, `126`) |
+| Fish variants (`349`, `350` meta) | Raw Fish / Cooked Fish |
+| Acacia Boat (`424`) | Boat (`333`) |
+| Unmapped items (> 422) | Stick (`280`) |
 
-1. Expanding block/item lookup tables in `_BLOCK_REMAP`.
-2. Refining tile-entity and NBT payload mapping during window clicks.
-3. Improving mob datawatcher mapping for 1.7-specific entities.
+### Entity & Metadata
+* **DataWatcher Translation:** `translate_datawatcher()` translates 1.7 entity metadata streams back to 1.6 format, handling item slots, text fields, and entity flags.
+* **Sound Mapping:** Maps 1.7 namespaced sounds (`game.player.hurt`, `entity.arrow.shoot`, etc.) back to legacy sound identifiers.
+* **Particle Conversion:** Converts 1.7 particle packets (`0x2A`) into corresponding `AuxSFX` (`0x3D`) sound and particle effects where applicable.
 
----
+## Known Limitations
+
+* **No Online Mode Auth:** The proxy does not authenticate against Mojang session servers. The backend server must be running in offline mode.
+* **Forge Handshakes:** Basic FML login packet structure is logged, but complex mod handshake channels are not fully mapped. This is intended primarily for vanilla clients and servers.
+* **Statistics & Achievements:** S2C statistics packets (`0x37`) are discarded.
 
 ## License
 
-This project is open-source under the [MIT License](https://github.com/oggoldencraft/legacy-bridge/blob/main/LICENSE).
+MIT License. See `LICENSE` for details.
